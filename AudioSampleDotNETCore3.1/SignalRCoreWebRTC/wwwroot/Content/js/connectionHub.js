@@ -1,10 +1,13 @@
 ﻿const isDebugging = true;
+var selfUser = null;
 var hubUrl = document.location.pathname + 'ConnectionHub';
 var wsconn = new signalR.HubConnectionBuilder()
     .withUrl(hubUrl, signalR.HttpTransportType.WebSockets)
     .configureLogging(signalR.LogLevel.None).build();
 
 var peerConnectionConfig = { "iceServers": [{ "url": "stun:stun.l.google.com:19302" }] };
+var audioinputs = [], audiooutputs = [];
+var localStream;
 //    "iceServers": [
 //        { "urls": "stun:stun.l.google.com:19302?transport=udp" },
 //        { "urls": "stun:numb.viagenie.ca:3478?transport=udp" },
@@ -13,7 +16,7 @@ var peerConnectionConfig = { "iceServers": [{ "url": "stun:stun.l.google.com:193
 //    ]
 //};
 
-$(document).ready(function () {
+$(function () {
     initializeSignalR();
 
     // Add click handler to users in the "Users" pane
@@ -42,7 +45,7 @@ $(document).ready(function () {
     });
 
     // Add handler for the hangup button
-    $('.hangup').click(function () {
+    $('.hangup').on('click', function () {
         console.log('hangup....');
         // Only allow hangup if we are not idle
         //localStream.getTracks().forEach(track => track.stop());
@@ -187,8 +190,9 @@ const initiateOffer = (partnerClientId, stream) => {
     var connection = getConnection(partnerClientId); // // get a connection for the given partner
     //console.log('initiate Offer stream: ', stream);
     //console.log("offer connection: ", connection);
-    connection.addStream(stream);// add our audio/video stream
-    console.log("WebRTC: Added local stream");
+    //connection.addStream(stream);// add our audio/video stream
+    connection.addTrack(stream.getAudioTracks()[0], stream)
+    console.log(`WebRTC: Added local stream: ${stream.getAudioTracks()[0]}`);
 
     connection.createOffer().then(offer => {
         console.log('WebRTC: created Offer: ');
@@ -226,8 +230,93 @@ const callbackUserMediaSuccess = (stream) => {
 
 const initializeUserMedia = () => {
     console.log('WebRTC: InitializeUserMedia: ');
-    navigator.getUserMedia(webrtcConstraints, callbackUserMediaSuccess, errorHandler);
+    navigator.mediaDevices.enumerateDevices()
+        .then((devices) => {
+            let inputElement = $('#audioinput_selector')
+            let outputElement = $('#audiooutput_selector')
+            devices.forEach((device) => {
+                console.log(`${device.kind}: ${device.label} id = ${device.deviceId} group = ${device.groupId}`);
+                if (device.kind == 'audioinput') {
+                    audioinputs.push(device);
+                    let option = document.createElement('option')
+                    option.value = device.deviceId;
+                    option.text = device.label;
+                    inputElement.append(option);
+                    if (device.deviceId == 'default') {
+                        $('#audioinput_selector option[value=default]').attr('selected', 'selected');
+                    }
+                }
+                else if (device.kind == 'audiooutput') {
+                    audiooutputs.push(device);
+                    let option = document.createElement('option')
+                    option.value = device.deviceId;
+                    option.text = device.label;
+                    outputElement.append(option);
+                    if (device.deviceId == 'default') {
+                        $('#audiooutput_selector option[value=default]').attr('selected', 'selected');
+                    }
+                }
+            });
+            webrtcConstraints.audio = devices.find((device) => (
+                device.kind.includes("input") &&
+                device.deviceId != "default"
+            ));
+            webrtcConstraints.echoCancellation = true;
+            console.log(webrtcConstraints.audio)
+            navigator.mediaDevices.getUserMedia(webrtcConstraints)
+                .then((stream) => {
+                    console.log("WebRTC: got media stream");
+                    localStream = stream;
+                    const audioTracks = localStream.getAudioTracks();
+                    if (audioTracks.length > 0) {
+                        console.log(`Using Audio device: ${audioTracks[0].label}`);
+                    }
+                })
+                .catch((error) => {
+                    errorHandler(error);
+                });
+        })
+        .catch((err) => {
+            console.error(`${err.name}: ${err.message}`);
+            errorHandler(err);
+        });
 };
+
+document.getElementById('audioinput_selector').onchange = function () {
+    webrtcConstraints.audio = audioinputs.find(device => device.deviceId = this.value);
+    navigator.mediaDevices.getUserMedia(webrtcConstraints)
+        .then(async (stream) => {
+            localStream = stream;
+            console.log(`Audio ${this.value}: ${stream}`)
+            for (let connection in connections) {
+                let sender = connections[connection].getSenders().find(sender => sender.track.kind == stream.getAudioTracks()[0].kind);
+                await sender.replaceTrack(stream.getAudioTracks()[0]);
+            }
+        })
+        .catch((err) => console.log(`${err}`));
+}
+
+document.getElementById('audiooutput_selector').onchange = function () {
+    let audioElement = document.querySelector('.audio.partner');
+    if (typeof audioElement.sinkId !== 'undefined') {
+        audioElement.setSinkId(this.value)
+            .then(() => {
+                console.log(`Success, audio output device attached: ${this.value}`)
+            })
+            .catch((error) => {
+                let errorMessage = error
+                if (error.name === 'SecurityError') {
+                    errorMessage = `You need to use HTTPS for selecting audio output device: ${error}`
+                }
+                console.error(errorMessage)
+                // Jump back to first output device in the list as it's the default.
+                audioOutputSelect.selectedIndex = 0
+            })
+    } else {
+        console.warn('Browser does not support output device selection.')
+    }
+}
+
 // stream removed
 const callbackRemoveStream = (connection, evt) => {
     console.log('WebRTC: removing remote stream from partner window');
@@ -264,6 +353,18 @@ const callbackIceCandidate = (evt, connection, partnerClientId) => {
     }
 }
 
+const callbackOnTrack = (evt) => {
+    console.log("WebRTC: track stream");
+    let audioElement = document.querySelector('.audio.partner');
+    let outputStream = new MediaStream();
+    for (let stream in evt.streams) {
+        outputStream.addTrack(evt.streams[stream].getAudioTracks()[0]);
+    }
+    //audioElement.srcObject = evt.streams[0];
+    console.log(outputStream.getAudioTracks().length)
+    audioElement.srcObject = outputStream;
+}
+
 const initializeConnection = (partnerClientId) => {
     console.log('WebRTC: Initializing connection...');
     //console.log("Received Param for connection: ", partnerClientId);
@@ -272,15 +373,17 @@ const initializeConnection = (partnerClientId) => {
 
     //connection.iceConnectionState = evt => console.log("WebRTC: iceConnectionState", evt); //not triggering on edge
     //connection.iceGatheringState = evt => console.log("WebRTC: iceGatheringState", evt); //not triggering on edge
-    //connection.ondatachannel = evt => console.log("WebRTC: ondatachannel", evt); //not triggering on edge
-    //connection.oniceconnectionstatechange = evt => console.log("WebRTC: oniceconnectionstatechange", evt); //triggering on state change 
-    //connection.onicegatheringstatechange = evt => console.log("WebRTC: onicegatheringstatechange", evt); //triggering on state change 
-    //connection.onsignalingstatechange = evt => console.log("WebRTC: onsignalingstatechange", evt); //triggering on state change 
-    //connection.ontrack = evt => console.log("WebRTC: ontrack", evt);
+    connection.onconnectionstatechange = ev => console.log("WebRTC: onconnectionstatechange", ev);
+    connection.ondatachannel = evt => console.log("WebRTC: ondatachannel", evt); //not triggering on edge
+    connection.oniceconnectionstatechange = evt => console.log("WebRTC: oniceconnectionstatechange", evt); //triggering on state change 
+    connection.onicegatheringstatechange = evt => console.log("WebRTC: onicegatheringstatechange", evt); //triggering on state change 
+    connection.onsignalingstatechange = evt => console.log("WebRTC: onsignalingstatechange", evt); //triggering on state change 
+    connection.ontrack = evt => callbackOnTrack(evt);
     connection.onicecandidate = evt => callbackIceCandidate(evt, connection, partnerClientId); // ICE Candidate Callback
-    //connection.onnegotiationneeded = evt => callbackNegotiationNeeded(connection, evt); // Negotiation Needed Callback
-    connection.onaddstream = evt => callbackAddStream(connection, evt); // Add stream handler callback
-    connection.onremovestream = evt => callbackRemoveStream(connection, evt); // Remove stream handler callback
+    connection.onicecandidateerror = ev => console.log("WebRTC: onicecandidateerror", ev); //not triggering on edge
+    connection.onnegotiationneeded = evt => callbackNegotiationNeeded(connection, evt); // Negotiation Needed Callback
+    //connection.onaddstream = evt => callbackAddStream(connection, evt); // Add stream handler callback
+    //connection.onremovestream = evt => callbackRemoveStream(connection, evt); // Remove stream handler callback
 
     connections[partnerClientId] = connection; // Store away the connection based on username
     //console.log(connection);
@@ -359,7 +462,15 @@ wsconn.on('incomingCall', (callingUser) => {
     alertify.confirm(callingUser.username + ' is calling.  Do you want to chat?', function (e) {
         if (e) {
             // I want to chat
-            wsconn.invoke('AnswerCall', true, callingUser).catch(err => console.log(err));
+            wsconn.invoke('AnswerCall', true, callingUser)
+                .then(() => {
+                let connection = getConnection(callingUser.ConnectionId);
+                if (!connection) {
+                    connection = initializeConnection(callingUser.ConnectionId);
+                }
+                connection.addTrack(localStream.getAudioTracks()[0], localStream);
+                })
+                .catch(err => console.log(err));
 
             // So lets go into call mode on the UI
             $('body').attr('data-mode', 'incall');
@@ -402,7 +513,7 @@ const initializeSignalR = () => {
 };
 
 const setUsername = (username) => {
-    consoleLogger('SingnalR: setting username...');
+    consoleLogger('SignalR: setting username...');
     wsconn.invoke("Join", username).catch((err) => {
         consoleLogger(err);
         alertify.alert('<h4>Failed SignalR Connection</h4> We were not able to connect you to the signaling server.<br/><br/>Error: ' + JSON.stringify(err));
